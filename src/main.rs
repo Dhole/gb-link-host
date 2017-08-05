@@ -5,19 +5,26 @@ extern crate num;
 extern crate serial;
 extern crate clap;
 extern crate bufstream;
+extern crate image;
+extern crate time;
+extern crate bit_vec;
+extern crate itertools;
 
 use std::io;
 // use std::io::{BufReader, BufWriter};
 use std::time::Duration;
 use std::process;
+// use std::fs::File;
+use std::path::Path;
 
 use num::FromPrimitive;
-
 use std::io::prelude::*;
 use serial::prelude::*;
 use bufstream::BufStream;
-
 use clap::{App, Arg};
+use image::ImageBuffer;
+use bit_vec::BitVec;
+use itertools::Itertools;
 
 #[derive(Debug, PartialEq)]
 enum Mode {
@@ -162,7 +169,7 @@ fn read_until_magic<T: SerialPort>(port: &mut BufStream<T>, magic: &[u8]) -> Res
     let mut idx = 0;
     loop {
         try!(port.read_exact(&mut buf));
-        println!("until_magic: {:02x}", buf[0]);
+        // println!("until_magic: {:02x}", buf[0]);
         if buf[0] == magic[idx] {
             idx += 1;
         }
@@ -173,9 +180,11 @@ fn read_until_magic<T: SerialPort>(port: &mut BufStream<T>, magic: &[u8]) -> Res
 }
 
 fn mode_printer<T: SerialPort>(mut port: &mut BufStream<T>) -> Result<(), io::Error> {
+    // The gameboy camera only checks the ACK on the first request (Init).
+    try!(port.write_all(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x00]));
+    try!(port.flush());
+    let mut tile_rows = Vec::<Vec<u8>>::new();
     loop {
-        try!(port.write_all(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x00]));
-        try!(port.flush());
         // Wait for the magic bytes.
         try!(read_until_magic(&mut port, &PRINT_MAGIC));
         let mut buf = vec![0; 4];
@@ -183,32 +192,94 @@ fn mode_printer<T: SerialPort>(mut port: &mut BufStream<T>) -> Result<(), io::Er
         try!(port.read_exact(&mut buf));
         let cmd = buf[0];
         let args = &buf[1..4];
-        println!("cmd, args: {:02x} {:02x} {:02x} {:02x}",
-                 cmd,
-                 args[0],
-                 args[1],
-                 args[2]);
+        // println!("cmd, args: {:02x} {:02x} {:02x} {:02x}", cmd, args[0], args[1], args[2]);
         let len = (args[1] as u16) + ((args[2] as u16) << 8);
         let mut payload = vec![0; len as usize];
         let mut checksum = vec![0; 2];
         try!(port.read_exact(&mut payload));
         try!(port.read_exact(&mut checksum));
-        println!("payload: {:?}", payload);
-        println!("checksum: {:02x} {:02x}", checksum[0], checksum[1]);
+        // println!("payload: {:?}", payload);
+        // println!("checksum: {:02x} {:02x}", checksum[0], checksum[1]);
         match PrintCommand::from_u8(cmd) {
-            Some(PrintCommand::Init) => {}
-            Some(PrintCommand::Print) => {}
-            Some(PrintCommand::Data) => {}
+            Some(PrintCommand::Init) => {
+                println!("Receiving data...");
+                tile_rows.clear();
+            }
+            Some(PrintCommand::Print) => {
+                let palette = &payload[2];
+                let filename = format!("gb_printer_{}.png",
+                                       time::now().strftime("%FT%H%M%S").unwrap());
+                println!("Saving image at {}", filename);
+                try!(printer_save_image(&tile_rows, palette, filename));
+            }
+            Some(PrintCommand::Data) => {
+                if len != 0 {
+                    tile_rows.push(payload);
+                }
+            }
             Some(PrintCommand::Status) => {}
             None => {}
         }
         let mut ack_status = vec![0; 2];
         try!(port.read_exact(&mut ack_status));
-        println!("ack, status = {:02x} {:02x}", ack_status[0], ack_status[1]);
+        // println!("ack, status = {:02x} {:02x}", ack_status[0], ack_status[1]);
         // try!(port.write_all(&[0x80, 0x00]));
         // try!(port.flush());
     }
-    // print!("{}", PrintCommand::Status as u8);
-    // print!("{:?}", PrintCommand::from_u8(0x0f));
-    // return Ok(());
+}
+
+fn printer_save_image(tile_rows: &Vec<Vec<u8>>,
+                      palette_byte: &u8,
+                      filename: String)
+                      -> Result<(), io::Error> {
+    // let mut img: ImageBuffer<image::Luma<u8>, Vec<<image::Luma<u8> as image::Pixel>::Subpixel>> =
+    //    ImageBuffer::new(160, 16 * tile_rows.len() as u32);
+    let palette: Vec<u8> = BitVec::from_bytes(&[*palette_byte])
+        .iter()
+        .tuples()
+        .map(|(h, l)| (l as u8) + 2 * (h as u8))
+        .map(|v| v * (255 / 3))
+        .collect();
+    let mut img = ImageBuffer::new(160, 16 * tile_rows.len() as u32);
+    img.put_pixel(0, 0, image::Luma([255u8]));
+
+    let mut pixel_rows = Vec::new();
+    for tile_row in tile_rows {
+        let (tile_row_a, tile_row_b) = tile_row.split_at(tile_row.len() / 2 as usize);
+        let mut pixel_rows_a = tile_row_to_pixel_rows(tile_row_a);
+        let mut pixel_rows_b = tile_row_to_pixel_rows(tile_row_b);
+        pixel_rows.append(&mut pixel_rows_a);
+        pixel_rows.append(&mut pixel_rows_b);
+    }
+
+    for (y, pixel_row) in pixel_rows.iter().enumerate() {
+        for (x, val) in pixel_row.iter().enumerate() {
+            img.put_pixel(x as u32, y as u32, image::Luma([palette[*val as usize]]));
+            // image::Luma([((*val as f32) / 3.0 * 255.0) as u8]));
+        }
+    }
+
+    img.save(&Path::new(&filename))?;
+    return Ok(());
+}
+
+fn tile_row_to_pixel_rows(tile_row: &[u8]) -> Vec<Vec<u8>> {
+    // let mut pixel_rows: Vec<Vec<u8>> = Vec::new();
+    let mut pixel_rows: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 160]).collect();
+    // let mut pixel_rows = Vec::new();
+    for i in 0..(tile_row.len() / 16 as usize) {
+        let tile = &tile_row[i * 16..i * 16 + 16];
+        for j in 0..8 {
+            let tile_pixel_row = BitVec::from_bytes(&[tile[j * 2]])
+                .iter()
+                .zip(BitVec::from_bytes(&[tile[j * 2 + 1]]).iter())
+                .map(|(l, h)| (l as u8) + 2 * (h as u8))
+                .collect::<Vec<u8>>();
+            // pixel_rows.push(tile_pixel_row);
+            for k in 0..8 {
+                pixel_rows[j][i * 8 + k] = tile_pixel_row[k];
+            }
+        }
+    }
+    return pixel_rows;
 }
