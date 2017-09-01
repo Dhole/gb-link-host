@@ -11,11 +11,13 @@ extern crate bit_vec;
 extern crate itertools;
 
 use std::io;
+use std::io::{Error, ErrorKind};
 // use std::io::{BufReader, BufWriter};
 use std::time::Duration;
 use std::process;
 // use std::fs::File;
 use std::path::Path;
+use std::process::Command;
 
 use num::FromPrimitive;
 use std::io::prelude::*;
@@ -32,10 +34,16 @@ enum Mode {
     Printer,
 }
 
+#[derive(Debug, PartialEq)]
+enum Board {
+    Generic,
+    St,
+}
+
 fn mode_char(mode: &Mode) -> u8 {
     match mode {
         &Mode::Sniff => b's',
-        &Mode::Printer => b'b',
+        &Mode::Printer => b'p',
     }
 }
 
@@ -78,6 +86,19 @@ fn main() {
                 "printer" => Ok(()),
                 mode => Err(format!("Invalid mode: {}", mode)),
             }))
+        .arg(Arg::with_name("board")
+            .help("Set the development board: generic, st")
+            .short("d")
+            .long("board")
+            .value_name("BOARD")
+            .default_value("st")
+            .takes_value(true)
+            .required(false)
+            .validator(|board| match board.as_str() {
+                "generic" => Ok(()),
+                "st" => Ok(()),
+                board => Err(format!("Invalid development board: {}", board)),
+            }))
         .get_matches();
 
     let serial = matches.value_of("serial").unwrap();
@@ -87,6 +108,12 @@ fn main() {
         "printer" => Mode::Printer,
         mode => panic!("Invalid mode: {}", mode),
     };
+    let board = match matches.value_of("board").unwrap() {
+        "generic" => Board::Generic,
+        "st" => Board::St,
+        board => panic!("Invalid board: {}", board),
+    };
+    println!("Development board is: {:?}", board);
     println!("Using serial device: {} at baud rate: {}", serial, baud);
 
     let mut port_raw = match serial::open(serial) {
@@ -112,6 +139,11 @@ fn main() {
         process::exit(1);
     });
 
+    dev_reset(board).unwrap_or_else(|e| {
+        println!("Error resetting development board: {}", e);
+        process::exit(1);
+    });
+
     let mut port = BufStream::new(port_raw);
     gb_link(&mut port, mode).unwrap_or_else(|e| {
         println!("Error from serial device {}: {}", serial, e);
@@ -119,8 +151,26 @@ fn main() {
     });
 }
 
+fn dev_reset(board: Board) -> Result<(), io::Error> {
+    match board {
+        Board::Generic => {
+            println!("Press the reset button on the board");
+        }
+        Board::St => {
+            println!("\nResetting board using st-flash utility...");
+            let output = Command::new("st-flash").arg("reset").output()?;
+            println!("{}", String::from_utf8_lossy(&output.stderr));
+            if !output.status.success() {
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("st-flash returned with error code {:?}",
+                                              output.status.code())));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn gb_link<T: SerialPort>(mut port: &mut BufStream<T>, mode: Mode) -> Result<(), io::Error> {
-    println!("Press the reset button on the board");
     let mut buf = Vec::new();
     loop {
         try!(port.read_until(b'\n', &mut buf));
@@ -181,8 +231,8 @@ fn read_until_magic<T: SerialPort>(port: &mut BufStream<T>, magic: &[u8]) -> Res
 
 fn mode_printer<T: SerialPort>(mut port: &mut BufStream<T>) -> Result<(), io::Error> {
     // The gameboy camera only checks the ACK on the first request (Init).
-    try!(port.write_all(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x00]));
-    try!(port.flush());
+    // try!(port.write_all(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x00]));
+    // try!(port.flush());
     let mut tile_rows = Vec::<Vec<u8>>::new();
     loop {
         // Wait for the magic bytes.
