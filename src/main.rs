@@ -18,6 +18,7 @@ use std::process;
 // use std::fs::File;
 use std::path::Path;
 use std::process::Command;
+use std::num::Wrapping;
 
 use num::FromPrimitive;
 use std::io::prelude::*;
@@ -32,6 +33,7 @@ use itertools::Itertools;
 enum Mode {
     Sniff,
     Printer,
+    Print,
 }
 
 #[derive(Debug, PartialEq)]
@@ -44,6 +46,7 @@ fn mode_char(mode: &Mode) -> u8 {
     match mode {
         &Mode::Sniff => b's',
         &Mode::Printer => b'p',
+        &Mode::Print => b'P',
     }
 }
 
@@ -52,7 +55,8 @@ fn main() {
         .version("0.1")
         .about("Interface for Gameboy link via serial")
         .author("Dhole")
-        .arg(Arg::with_name("baud")
+        .arg(
+            Arg::with_name("baud")
             .help("Set the baud rate")
             .short("b")
             .long("baud")
@@ -64,41 +68,49 @@ fn main() {
             .validator(|baud| match baud.parse::<usize>() {
                 Ok(_) => Ok(()),
                 Err(e) => Err(format!("{}", e)),
-            }))
-        .arg(Arg::with_name("serial")
-            .help("Set the serial device")
-            .short("s")
-            .long("serial")
-            .value_name("DEVICE")
-            .default_value("/dev/ttyACM0")
-            .takes_value(true)
-            .required(false))
-        .arg(Arg::with_name("mode")
-            .help("Set the device mode: sniff, printer")
-            .short("m")
-            .long("mode")
-            .value_name("MODE")
-            .default_value("sniff")
-            .takes_value(true)
-            .required(false)
-            .validator(|mode| match mode.as_str() {
-                "sniff" => Ok(()),
-                "printer" => Ok(()),
-                mode => Err(format!("Invalid mode: {}", mode)),
-            }))
-        .arg(Arg::with_name("board")
-            .help("Set the development board: generic, st")
-            .short("d")
-            .long("board")
-            .value_name("BOARD")
-            .default_value("st")
-            .takes_value(true)
-            .required(false)
-            .validator(|board| match board.as_str() {
-                "generic" => Ok(()),
-                "st" => Ok(()),
-                board => Err(format!("Invalid development board: {}", board)),
-            }))
+            }),
+        )
+        .arg(
+            Arg::with_name("serial")
+                .help("Set the serial device")
+                .short("s")
+                .long("serial")
+                .value_name("DEVICE")
+                .default_value("/dev/ttyACM0")
+                .takes_value(true)
+                .required(false),
+        )
+        .arg(
+            Arg::with_name("mode")
+                .help("Set the device mode: sniff, printer, print")
+                .short("m")
+                .long("mode")
+                .value_name("MODE")
+                .default_value("sniff")
+                .takes_value(true)
+                .required(false)
+                .validator(|mode| match mode.as_str() {
+                    "sniff" => Ok(()),
+                    "printer" => Ok(()),
+                    "print" => Ok(()),
+                    mode => Err(format!("Invalid mode: {}", mode)),
+                }),
+        )
+        .arg(
+            Arg::with_name("board")
+                .help("Set the development board: generic, st")
+                .short("d")
+                .long("board")
+                .value_name("BOARD")
+                .default_value("st")
+                .takes_value(true)
+                .required(false)
+                .validator(|board| match board.as_str() {
+                    "generic" => Ok(()),
+                    "st" => Ok(()),
+                    board => Err(format!("Invalid development board: {}", board)),
+                }),
+        )
         .get_matches();
 
     let serial = matches.value_of("serial").unwrap();
@@ -106,6 +118,7 @@ fn main() {
     let mode = match matches.value_of("mode").unwrap() {
         "sniff" => Mode::Sniff,
         "printer" => Mode::Printer,
+        "print" => Mode::Print,
         mode => panic!("Invalid mode: {}", mode),
     };
     let board = match matches.value_of("board").unwrap() {
@@ -123,7 +136,8 @@ fn main() {
             process::exit(1);
         }
     };
-    port_raw.configure(&serial::PortSettings {
+    port_raw
+        .configure(&serial::PortSettings {
             baud_rate: serial::BaudRate::from_speed(baud),
             char_size: serial::Bits8,
             parity: serial::ParityNone,
@@ -134,10 +148,12 @@ fn main() {
             println!("Error configuring {}: {}", serial, e);
             process::exit(1);
         });
-    port_raw.set_timeout(Duration::from_secs(3600 * 24)).unwrap_or_else(|e| {
-        println!("Error setting timeout for {}: {}", serial, e);
-        process::exit(1);
-    });
+    port_raw
+        .set_timeout(Duration::from_secs(3600 * 24))
+        .unwrap_or_else(|e| {
+            println!("Error setting timeout for {}: {}", serial, e);
+            process::exit(1);
+        });
 
     dev_reset(board).unwrap_or_else(|e| {
         println!("Error resetting development board: {}", e);
@@ -161,9 +177,13 @@ fn dev_reset(board: Board) -> Result<(), io::Error> {
             let output = Command::new("st-flash").arg("reset").output()?;
             println!("{}", String::from_utf8_lossy(&output.stderr));
             if !output.status.success() {
-                return Err(Error::new(ErrorKind::Other,
-                                      format!("st-flash returned with error code {:?}",
-                                              output.status.code())));
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "st-flash returned with error code {:?}",
+                        output.status.code()
+                    ),
+                ));
             }
         }
     }
@@ -188,6 +208,7 @@ fn gb_link<T: SerialPort>(mut port: &mut BufStream<T>, mode: Mode) -> Result<(),
     match mode {
         Mode::Sniff => mode_sniff(&mut port),
         Mode::Printer => mode_printer(&mut port),
+        Mode::Print => mode_print(&mut port),
     }
 }
 
@@ -257,8 +278,10 @@ fn mode_printer<T: SerialPort>(mut port: &mut BufStream<T>) -> Result<(), io::Er
             }
             Some(PrintCommand::Print) => {
                 let palette = &payload[2];
-                let filename = format!("gb_printer_{}.png",
-                                       time::now().strftime("%FT%H%M%S").unwrap());
+                let filename = format!(
+                    "gb_printer_{}.png",
+                    time::now().strftime("%FT%H%M%S").unwrap()
+                );
                 println!("Saving image at {}", filename);
                 try!(printer_save_image(&tile_rows, palette, filename));
             }
@@ -278,10 +301,11 @@ fn mode_printer<T: SerialPort>(mut port: &mut BufStream<T>) -> Result<(), io::Er
     }
 }
 
-fn printer_save_image(tile_rows: &Vec<Vec<u8>>,
-                      palette_byte: &u8,
-                      filename: String)
-                      -> Result<(), io::Error> {
+fn printer_save_image(
+    tile_rows: &Vec<Vec<u8>>,
+    palette_byte: &u8,
+    filename: String,
+) -> Result<(), io::Error> {
     // let mut img: ImageBuffer<image::Luma<u8>, Vec<<image::Luma<u8> as image::Pixel>::Subpixel>> =
     //    ImageBuffer::new(160, 16 * tile_rows.len() as u32);
     let palette: Vec<u8> = BitVec::from_bytes(&[*palette_byte])
@@ -332,4 +356,52 @@ fn tile_row_to_pixel_rows(tile_row: &[u8]) -> Vec<Vec<u8>> {
         }
     }
     return pixel_rows;
+}
+
+fn mode_print<T: SerialPort>(mut port: &mut BufStream<T>) -> Result<(), io::Error> {
+    let mut buf: Vec<u8> = vec![
+        0x88, // MAGIC
+        0x33,
+        0x01, // CMD
+        0x00, // ARG, ,
+        0x00, // LEN_LOW
+        0x00, // LEN_HIGH
+        0x00, // CRC
+        0x00,
+        0x00, // Reply AKC
+        0x00, // Reply STATUS
+    ];
+    //let mut crc = Wrapping(0u16);
+    //for b in buf[2..].iter() {
+    //    crc += Wrapping(*b as u16);
+    //}
+    println!("Turn on the GameBoy Printer and then press any key to continue...");
+    let _ = io::stdin().read(&mut [0u8]).unwrap();
+
+    try!(port.write_all(&[0x00]));
+    try!(port.flush());
+
+    let buf_len = buf.len();
+    //buf[buf_len - 4] = (crc.0 & 0xff) as u8;
+    //buf[buf_len - 3] = ((crc.0 & 0xff00) >> 8) as u8;
+    buf[buf_len - 4] = 0x01;
+    let len_low = (buf.len() & 0xff) as u8;
+    let len_high = ((buf.len() & 0xff00) >> 8) as u8;
+    try!(port.write_all(&[len_low, len_high]));
+    try!(port.flush());
+    println!("Sent length");
+    try!(port.write_all(&buf));
+    try!(port.flush());
+    println!("Sent payload");
+
+    //let mut ack_status = vec![0; 2];
+    //try!(port.read_exact(&mut ack_status));
+    //println!("ACK: {:x}, STATUS: {:x}", ack_status[0], ack_status[1]);
+    let mut byte = vec![0; 1];
+    loop {
+        try!(port.read_exact(&mut byte));
+        println!("0x{:02x}", byte[0]);
+    }
+
+    return Ok(());
 }
