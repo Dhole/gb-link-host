@@ -18,7 +18,7 @@ use std::process;
 // use std::fs::File;
 use std::path::Path;
 use std::process::Command;
-use std::num::Wrapping;
+//use std::num::Wrapping;
 
 use num::FromPrimitive;
 use std::io::prelude::*;
@@ -358,7 +358,7 @@ fn tile_row_to_pixel_rows(tile_row: &[u8]) -> Vec<Vec<u8>> {
     return pixel_rows;
 }
 
-fn mode_print<T: SerialPort>(mut port: &mut BufStream<T>) -> Result<(), io::Error> {
+fn mode_print<T: SerialPort>(port: &mut BufStream<T>) -> Result<(), io::Error> {
     let mut buf: Vec<u8> = vec![
         0x88, // MAGIC
         0x33,
@@ -366,7 +366,7 @@ fn mode_print<T: SerialPort>(mut port: &mut BufStream<T>) -> Result<(), io::Erro
         0x00, // ARG, ,
         0x00, // LEN_LOW
         0x00, // LEN_HIGH
-        0x00, // CRC
+        0x01, // CRC
         0x00,
         0x00, // Reply AKC
         0x00, // Reply STATUS
@@ -403,5 +403,5 @@ fn mode_print<T: SerialPort>(mut port: &mut BufStream<T>) -> Result<(), io::Erro
         println!("0x{:02x}", byte[0]);
     }
 
-    return Ok(());
+    //return Ok(());
 }
