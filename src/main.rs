@@ -27,6 +27,7 @@ use serial::prelude::*;
 use bufstream::BufStream;
 use clap::{App, Arg};
 use image::ImageBuffer;
+use image::GenericImage;
 use bit_vec::BitVec;
 use itertools::Itertools;
 
@@ -112,6 +113,15 @@ fn main() {
                     board => Err(format!("Invalid development board: {}", board)),
                 }),
         )
+        .arg(
+            Arg::with_name("file")
+                .help("Image file to print")
+                .short("f")
+                .long("file")
+                .value_name("FILE")
+                .takes_value(true)
+                .required(false),
+        )
         .get_matches();
 
     let serial = matches.value_of("serial").unwrap();
@@ -121,6 +131,13 @@ fn main() {
         "printer" => Mode::Printer,
         "print" => Mode::Print,
         mode => panic!("Invalid mode: {}", mode),
+    };
+    let filename = match matches.value_of("file") {
+        Some(filename) => filename,
+        None => {
+            println!("Please, select a file to print with `-f FILE`");
+            return ();
+        }
     };
     let board = match matches.value_of("board").unwrap() {
         "generic" => Board::Generic,
@@ -162,7 +179,7 @@ fn main() {
     });
 
     let mut port = BufStream::new(port_raw);
-    gb_link(&mut port, mode).unwrap_or_else(|e| {
+    gb_link(&mut port, mode, filename).unwrap_or_else(|e| {
         println!("Error from serial device {}: {}", serial, e);
         process::exit(1);
     });
@@ -191,7 +208,7 @@ fn dev_reset(board: Board) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn gb_link<T: SerialPort>(mut port: &mut BufStream<T>, mode: Mode) -> Result<(), io::Error> {
+fn gb_link<T: SerialPort>(mut port: &mut BufStream<T>, mode: Mode, filename: &str) -> Result<(), io::Error> {
     let mut buf = Vec::new();
     loop {
         try!(port.read_until(b'\n', &mut buf));
@@ -209,7 +226,7 @@ fn gb_link<T: SerialPort>(mut port: &mut BufStream<T>, mode: Mode) -> Result<(),
     match mode {
         Mode::Sniff => mode_sniff(&mut port),
         Mode::Printer => mode_printer(&mut port),
-        Mode::Print => mode_print(&mut port),
+        Mode::Print => mode_print(&mut port, filename),
     }
 }
 
@@ -238,13 +255,7 @@ enum PrintCommand {
 }
 
 #[derive(Debug, PartialEq)]
-enum PrinterStatus {
-    Ok,
-    Info(PrinterStatusInfo),
-}
-
-#[derive(Debug, PartialEq)]
-struct PrinterStatusInfo {
+struct PrinterStatus {
     checksum_error: bool,
     printer_busy: bool,
     image_data_full: bool,
@@ -255,8 +266,8 @@ struct PrinterStatusInfo {
     battery_too_low: bool,
 }
 
-impl PrinterStatusInfo {
-    fn any_error(&self) -> bool {
+impl PrinterStatus {
+    fn any_info(&self) -> bool {
         return self.checksum_error ||
                self.printer_busy ||
                self.image_data_full ||
@@ -266,11 +277,21 @@ impl PrinterStatusInfo {
                self.other_error ||
                self.battery_too_low;
     }
+    fn any_error(&self) -> bool {
+        return self.checksum_error ||
+               //self.printer_busy ||
+               //self.image_data_full ||
+               //self.unprocessed_data ||
+               self.packet_error ||
+               self.paper_jam ||
+               self.other_error ||
+               self.battery_too_low;
+    }
 }
 
 impl From<u8> for PrinterStatus {
     fn from(b: u8) -> Self {
-        let info = PrinterStatusInfo{
+        PrinterStatus {
             checksum_error:   (b & (0x01 << 0)) != 0,
             printer_busy:     (b & (0x01 << 1)) != 0,
             image_data_full:   (b & (0x01 << 2)) != 0,
@@ -279,11 +300,6 @@ impl From<u8> for PrinterStatus {
             paper_jam:        (b & (0x01 << 5)) != 0,
             other_error:      (b & (0x01 << 6)) != 0,
             battery_too_low:   (b & (0x01 << 7)) != 0,
-        };
-        if info.any_error() {
-            PrinterStatus::Info(info)
-        } else {
-            PrinterStatus::Ok
         }
     }
 }
@@ -448,7 +464,7 @@ fn send_print_cmd<T: SerialPort>(port: &mut BufStream<T>, cmd: PrintCommand, pay
 
     let mut ack_status = vec![0; 2];
     try!(port.read_exact(&mut ack_status));
-    println!("{:?} -> ACK: {:x}, STATUS: {:x}", cmd, ack_status[0], ack_status[1]);
+    //println!("{:?} -> ACK: {:x}, STATUS: {:x}", cmd, ack_status[0], ack_status[1]);
     if ack_status[0] == PRINT_ACK {
         return Ok(Some(PrinterStatus::from(ack_status[1])));
     } else {
@@ -456,23 +472,83 @@ fn send_print_cmd<T: SerialPort>(port: &mut BufStream<T>, cmd: PrintCommand, pay
     }
 }
 
-fn mode_print<T: SerialPort>(port: &mut BufStream<T>) -> Result<(), io::Error> {
-    //let mut buf: Vec<u8> = vec![
-    //    0x88, // MAGIC
-    //    0x33,
-    //    0x01, // CMD
-    //    0x00, // ARG, ,
-    //    0x00, // LEN_LOW
-    //    0x00, // LEN_HIGH
-    //    0x01, // CRC
-    //    0x00,
-    //    0x00, // Reply AKC
-    //    0x00, // Reply STATUS
-    //];
-    //let mut crc = Wrapping(0u16);
-    //for b in buf[2..].iter() {
-    //    crc += Wrapping(*b as u16);
-    //}
+fn img_to_tile_rows(img: image::GrayImage) -> Vec<Vec<u8>> {
+    let mut tile_rows: Vec<Vec<u8>> = (0..img.height()/16).map(|_| vec![0u8; 640]).collect();
+    for row in 0..img.height()/8 {
+        for col in 0..img.width()/8 {
+            for y in 0..8 {
+                let mut lsb = 0 as u8;
+                let mut msb = 0 as u8;
+                for x in 0..8 {
+                    let p = img.get_pixel(col * 8 + x, row * 8 + y).data[0];
+                    let (low, high) = if p < 64 {
+                        (1, 1)
+                    } else if p < 128 {
+                        (0, 1)
+                    } else if p < 192 {
+                        (1, 0)
+                    } else {
+                        (0, 0)
+                    };
+                    lsb = lsb | (low  << (7-x));
+                    msb = msb | (high << (7-x));
+                }
+                tile_rows[(row/2) as usize][((row % 2) * 320 + col*16 + y*2    ) as usize] = lsb;
+                tile_rows[(row/2) as usize][((row % 2) * 320 + col*16 + y*2 + 1) as usize] = msb;
+            }
+        }
+    }
+    return tile_rows;
+}
+
+macro_rules! check_ack {
+    ($a:expr) => {
+        match $a {
+            None => {
+                println!("Gameboy Printer didn't ACK, exiting...");
+                return Ok(());
+            },
+            Some(status) => status,
+        }
+    }
+}
+
+macro_rules! check_status_error {
+    ($a:expr) => {
+        if $a.any_error() {
+            println!("Error: Gameboy Printer: {:?}", $a);
+            return Ok(());
+        }
+    }
+}
+
+fn mode_print<T: SerialPort>(port: &mut BufStream<T>, filename: &str) -> Result<(), io::Error> {
+    let img = match image::open(&Path::new(filename)) {
+        Ok(img) => img,
+        Err(err) => {
+            println!("Error opening image at file {:?}: {:?}", filename, err);
+            return Ok(());
+        }
+    };
+    let img = img.grayscale();
+    if img.height() == 160 {
+        img.rotate90();
+    }
+    if img.width() != 160 {
+        println!("Error: image {:?} width should be 160 instead of {:?}", filename, img.width());
+        return Ok(());
+    }
+
+    // TODO: Accept any heigth
+    if img.height() != 144 {
+        panic!("height != 144 not yet supported");
+    }
+
+    let img = img.to_luma();
+    let tile_rows = img_to_tile_rows(img);
+    //println!("{:?} {:?} {:?} {:?}", img.get_pixel(8,0), img.get_pixel(9,0), img.get_pixel(10,0), img.get_pixel(11,0));
+    //return Ok(());
+
     println!("Turn on the GameBoy Printer and then press any key to continue...");
     let _ = io::stdin().read(&mut [0u8]).unwrap();
 
@@ -481,105 +557,38 @@ fn mode_print<T: SerialPort>(port: &mut BufStream<T>) -> Result<(), io::Error> {
     try!(port.flush());
 
     // Init printer
-    let ack = send_print_cmd(port, PrintCommand::Init, &[])?;
-    if ack != Some(PrinterStatus::Ok) {
-        println!("{:?}", ack);
+    println!("Initializing printer...");
+    let status = check_ack!(send_print_cmd(port, PrintCommand::Init, &[])?);
+    if status.any_info() {
+        println!("Error: {:?}", status);
         return Ok(());
     }
     // Send data
-    for x in 0..1 {
-        let ack = send_print_cmd(port, PrintCommand::Data, &[0xFF; 640])?;
-        if let Some(status) = ack {
-            if let PrinterStatus::Info(info) = status {
-                if info.unprocessed_data {
-                } else {
-                    println!("{:?}", info);
-                    return Ok(());
-                }
-            }
-        } else {
-            println!("Gameboy Printer didn't ACK, exiting...");
-            return Ok(());
-        }
-        let ack = send_print_cmd(port, PrintCommand::Status, &[])?;
-        if let Some(status) = ack {
-            if let PrinterStatus::Info(info) = status {
-                if info.unprocessed_data {
-                } else {
-                    println!("{:?}", info);
-                    return Ok(());
-                }
-            }
-        } else {
-            println!("Gameboy Printer didn't ACK, exiting...");
-            return Ok(());
-        }
+    println!("Sending data to printer...");
+    for tile_row in tile_rows {
+        //println!("{:?}", tile_row);
+        check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Data, &tile_row)?));
+        check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Status, &[])?));
     }
     // Send 0 length data to notify the Printer that we've sent all data
-    let ack = send_print_cmd(port, PrintCommand::Data, &[])?;
-    if let Some(status) = ack {
-        if let PrinterStatus::Info(info) = status {
-            if info.unprocessed_data {
-            } else {
-                println!("{:?}", info);
-                return Ok(());
-            }
-        }
-    } else {
-        println!("Gameboy Printer didn't ACK, exiting...");
-        return Ok(());
-    }
+    check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Data, &[])?));
     // Print
-    let ack = send_print_cmd(port, PrintCommand::Print, &[0x01, 0x13, 0xE4, 0x40])?;
-    if let Some(status) = ack {
-        if let PrinterStatus::Info(info) = status {
-            if info.unprocessed_data {
-            } else {
-                println!("{:?}", info);
-                return Ok(());
-            }
-        }
-    } else {
-        println!("Gameboy Printer didn't ACK, exiting...");
-        return Ok(());
-    }
+    println!("Printing...");
+    check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Print, &[0x01, 0x13, 0xE4, 0x40])?));
     // Query status
     let sleep_time = Duration::from_millis(500);
     loop {
         thread::sleep(sleep_time);
-        match send_print_cmd(port, PrintCommand::Status, &[])? {
-            Some(status) => match status {
-                PrinterStatus::Ok => { break; },
-                PrinterStatus::Info(info) => { println!("{:?}", info); },
-            },
-            None => {
-                println!("Gameboy Printer didn't ACK, exiting...");
-                break;
-            },
+        let status = check_ack!(send_print_cmd(port, PrintCommand::Print, &[0x01, 0x13, 0xE4, 0x4F])?);
+        check_status_error!(status);
+        if !status.any_info() {
+            println!("Printing successfull!");
+            break;
+        } else if !status.printer_busy {
+            println!("Error: {:?}", status);
+            return Ok(());
         }
     }
-
-    //let buf_len = buf.len();
-    //buf[buf_len - 4] = (crc.0 & 0xff) as u8;
-    //buf[buf_len - 3] = ((crc.0 & 0xff00) >> 8) as u8;
-    //buf[buf_len - 4] = 0x01;
-    //let len_low = (buf.len() & 0xff) as u8;
-    //let len_high = ((buf.len() & 0xff00) >> 8) as u8;
-    //try!(port.write_all(&[len_low, len_high]));
-    //try!(port.flush());
-    //println!("Sent length");
-    //try!(port.write_all(&buf));
-    //try!(port.flush());
-    //println!("Sent payload");
-
-    //let mut ack_status = vec![0; 2];
-    //try!(port.read_exact(&mut ack_status));
-    //println!("ACK: {:x}, STATUS: {:x}", ack_status[0], ack_status[1]);
-    //let mut byte = vec![0; 1];
-    //loop {
-    //    try!(port.read_exact(&mut byte));
-    //    println!("0x{:02x}", byte[0]);
-    //}
 
     return Ok(());
 }
