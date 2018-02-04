@@ -13,12 +13,13 @@ extern crate itertools;
 use std::io;
 use std::io::{Error, ErrorKind};
 // use std::io::{BufReader, BufWriter};
+use std::thread;
 use std::time::Duration;
 use std::process;
 // use std::fs::File;
 use std::path::Path;
 use std::process::Command;
-//use std::num::Wrapping;
+use std::num::Wrapping;
 
 use num::FromPrimitive;
 use std::io::prelude::*;
@@ -224,15 +225,67 @@ fn mode_sniff<T: SerialPort>(port: &mut BufStream<T>) -> Result<(), io::Error> {
 }
 
 const PRINT_MAGIC: [u8; 2] = [0x88, 0x33];
+const PRINT_ACK: u8 = 0x81;
 
 enum_from_primitive! {
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Copy, Clone)]
 enum PrintCommand {
     Init = 0x01,
     Print = 0x02,
     Data = 0x04,
     Status = 0x0f,
 }
+}
+
+#[derive(Debug, PartialEq)]
+enum PrinterStatus {
+    Ok,
+    Info(PrinterStatusInfo),
+}
+
+#[derive(Debug, PartialEq)]
+struct PrinterStatusInfo {
+    checksum_error: bool,
+    printer_busy: bool,
+    image_data_full: bool,
+    unprocessed_data: bool,
+    packet_error: bool,
+    paper_jam: bool,
+    other_error: bool,
+    battery_too_low: bool,
+}
+
+impl PrinterStatusInfo {
+    fn any_error(&self) -> bool {
+        return self.checksum_error ||
+               self.printer_busy ||
+               self.image_data_full ||
+               self.unprocessed_data ||
+               self.packet_error ||
+               self.paper_jam ||
+               self.other_error ||
+               self.battery_too_low;
+    }
+}
+
+impl From<u8> for PrinterStatus {
+    fn from(b: u8) -> Self {
+        let info = PrinterStatusInfo{
+            checksum_error:   (b & (0x01 << 0)) != 0,
+            printer_busy:     (b & (0x01 << 1)) != 0,
+            image_data_full:   (b & (0x01 << 2)) != 0,
+            unprocessed_data: (b & (0x01 << 3)) != 0,
+            packet_error:     (b & (0x01 << 4)) != 0,
+            paper_jam:        (b & (0x01 << 5)) != 0,
+            other_error:      (b & (0x01 << 6)) != 0,
+            battery_too_low:   (b & (0x01 << 7)) != 0,
+        };
+        if info.any_error() {
+            PrinterStatus::Info(info)
+        } else {
+            PrinterStatus::Ok
+        }
+    }
 }
 
 fn read_until_magic<T: SerialPort>(port: &mut BufStream<T>, magic: &[u8]) -> Result<(), io::Error> {
@@ -358,19 +411,64 @@ fn tile_row_to_pixel_rows(tile_row: &[u8]) -> Vec<Vec<u8>> {
     return pixel_rows;
 }
 
+fn u16_to_low_high (w: u16) -> [u8; 2] {
+    return [(w & 0xff) as u8, ((w & 0xff00) >> 8) as u8];
+}
+
+fn gen_crc(cmd: PrintCommand, payload: &[u8]) -> [u8; 2] {
+    let mut crc = Wrapping(0u16);
+    crc += Wrapping(cmd as u16);
+    let len = u16_to_low_high(payload.len() as u16);
+    crc += Wrapping(len[0] as u16);
+    crc += Wrapping(len[1] as u16);
+    for b in payload {
+        crc += Wrapping(*b as u16);
+    }
+    return u16_to_low_high(crc.0);
+}
+
+fn send_print_cmd<T: SerialPort>(port: &mut BufStream<T>, cmd: PrintCommand, payload: &[u8]) -> Result<Option<PrinterStatus>, io::Error> {
+    // Tell stm32f411 the data length
+    port.write_all(&u16_to_low_high(10 + payload.len() as u16))?;
+    // write magic
+    port.write_all(&PRINT_MAGIC)?;
+    // write cmd
+    port.write_all(&[cmd as u8])?;
+    // write arg
+    port.write_all(&[0x00])?;
+    // write len
+    port.write_all(&u16_to_low_high(payload.len() as u16))?;
+    // write payload
+    port.write_all(payload)?;
+    // write crc
+    port.write_all(&gen_crc(cmd, payload))?;
+    // write empty array to receive ACK and STATUS
+    port.write_all(&[0; 2])?;
+    port.flush()?;
+
+    let mut ack_status = vec![0; 2];
+    try!(port.read_exact(&mut ack_status));
+    println!("{:?} -> ACK: {:x}, STATUS: {:x}", cmd, ack_status[0], ack_status[1]);
+    if ack_status[0] == PRINT_ACK {
+        return Ok(Some(PrinterStatus::from(ack_status[1])));
+    } else {
+        return Ok(None);
+    }
+}
+
 fn mode_print<T: SerialPort>(port: &mut BufStream<T>) -> Result<(), io::Error> {
-    let mut buf: Vec<u8> = vec![
-        0x88, // MAGIC
-        0x33,
-        0x01, // CMD
-        0x00, // ARG, ,
-        0x00, // LEN_LOW
-        0x00, // LEN_HIGH
-        0x01, // CRC
-        0x00,
-        0x00, // Reply AKC
-        0x00, // Reply STATUS
-    ];
+    //let mut buf: Vec<u8> = vec![
+    //    0x88, // MAGIC
+    //    0x33,
+    //    0x01, // CMD
+    //    0x00, // ARG, ,
+    //    0x00, // LEN_LOW
+    //    0x00, // LEN_HIGH
+    //    0x01, // CRC
+    //    0x00,
+    //    0x00, // Reply AKC
+    //    0x00, // Reply STATUS
+    //];
     //let mut crc = Wrapping(0u16);
     //for b in buf[2..].iter() {
     //    crc += Wrapping(*b as u16);
@@ -378,30 +476,110 @@ fn mode_print<T: SerialPort>(port: &mut BufStream<T>) -> Result<(), io::Error> {
     println!("Turn on the GameBoy Printer and then press any key to continue...");
     let _ = io::stdin().read(&mut [0u8]).unwrap();
 
+    // Send confirmation to notify that the printer has ben turned on
     try!(port.write_all(&[0x00]));
     try!(port.flush());
 
-    let buf_len = buf.len();
+    // Init printer
+    let ack = send_print_cmd(port, PrintCommand::Init, &[])?;
+    if ack != Some(PrinterStatus::Ok) {
+        println!("{:?}", ack);
+        return Ok(());
+    }
+    // Send data
+    for x in 0..1 {
+        let ack = send_print_cmd(port, PrintCommand::Data, &[0xFF; 640])?;
+        if let Some(status) = ack {
+            if let PrinterStatus::Info(info) = status {
+                if info.unprocessed_data {
+                } else {
+                    println!("{:?}", info);
+                    return Ok(());
+                }
+            }
+        } else {
+            println!("Gameboy Printer didn't ACK, exiting...");
+            return Ok(());
+        }
+        let ack = send_print_cmd(port, PrintCommand::Status, &[])?;
+        if let Some(status) = ack {
+            if let PrinterStatus::Info(info) = status {
+                if info.unprocessed_data {
+                } else {
+                    println!("{:?}", info);
+                    return Ok(());
+                }
+            }
+        } else {
+            println!("Gameboy Printer didn't ACK, exiting...");
+            return Ok(());
+        }
+    }
+    // Send 0 length data to notify the Printer that we've sent all data
+    let ack = send_print_cmd(port, PrintCommand::Data, &[])?;
+    if let Some(status) = ack {
+        if let PrinterStatus::Info(info) = status {
+            if info.unprocessed_data {
+            } else {
+                println!("{:?}", info);
+                return Ok(());
+            }
+        }
+    } else {
+        println!("Gameboy Printer didn't ACK, exiting...");
+        return Ok(());
+    }
+    // Print
+    let ack = send_print_cmd(port, PrintCommand::Print, &[0x01, 0x13, 0xE4, 0x40])?;
+    if let Some(status) = ack {
+        if let PrinterStatus::Info(info) = status {
+            if info.unprocessed_data {
+            } else {
+                println!("{:?}", info);
+                return Ok(());
+            }
+        }
+    } else {
+        println!("Gameboy Printer didn't ACK, exiting...");
+        return Ok(());
+    }
+    // Query status
+    let sleep_time = Duration::from_millis(500);
+    loop {
+        thread::sleep(sleep_time);
+        match send_print_cmd(port, PrintCommand::Status, &[])? {
+            Some(status) => match status {
+                PrinterStatus::Ok => { break; },
+                PrinterStatus::Info(info) => { println!("{:?}", info); },
+            },
+            None => {
+                println!("Gameboy Printer didn't ACK, exiting...");
+                break;
+            },
+        }
+    }
+
+    //let buf_len = buf.len();
     //buf[buf_len - 4] = (crc.0 & 0xff) as u8;
     //buf[buf_len - 3] = ((crc.0 & 0xff00) >> 8) as u8;
-    buf[buf_len - 4] = 0x01;
-    let len_low = (buf.len() & 0xff) as u8;
-    let len_high = ((buf.len() & 0xff00) >> 8) as u8;
-    try!(port.write_all(&[len_low, len_high]));
-    try!(port.flush());
-    println!("Sent length");
-    try!(port.write_all(&buf));
-    try!(port.flush());
-    println!("Sent payload");
+    //buf[buf_len - 4] = 0x01;
+    //let len_low = (buf.len() & 0xff) as u8;
+    //let len_high = ((buf.len() & 0xff00) >> 8) as u8;
+    //try!(port.write_all(&[len_low, len_high]));
+    //try!(port.flush());
+    //println!("Sent length");
+    //try!(port.write_all(&buf));
+    //try!(port.flush());
+    //println!("Sent payload");
 
     //let mut ack_status = vec![0; 2];
     //try!(port.read_exact(&mut ack_status));
     //println!("ACK: {:x}, STATUS: {:x}", ack_status[0], ack_status[1]);
-    let mut byte = vec![0; 1];
-    loop {
-        try!(port.read_exact(&mut byte));
-        println!("0x{:02x}", byte[0]);
-    }
+    //let mut byte = vec![0; 1];
+    //loop {
+    //    try!(port.read_exact(&mut byte));
+    //    println!("0x{:02x}", byte[0]);
+    //}
 
-    //return Ok(());
+    return Ok(());
 }
