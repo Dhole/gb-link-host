@@ -13,6 +13,7 @@ extern crate itertools;
 use std::io;
 use std::io::{Error, ErrorKind};
 // use std::io::{BufReader, BufWriter};
+use std::cmp;
 use std::thread;
 use std::time::Duration;
 use std::process;
@@ -522,46 +523,13 @@ macro_rules! check_status_error {
     }
 }
 
-fn mode_print<T: SerialPort>(port: &mut BufStream<T>, filename: &str) -> Result<(), io::Error> {
-    let img = match image::open(&Path::new(filename)) {
-        Ok(img) => img,
-        Err(err) => {
-            println!("Error opening image at file {:?}: {:?}", filename, err);
-            return Ok(());
-        }
-    };
-    let img = img.grayscale();
-    if img.height() == 160 {
-        img.rotate90();
-    }
-    if img.width() != 160 {
-        println!("Error: image {:?} width should be 160 instead of {:?}", filename, img.width());
-        return Ok(());
-    }
-
-    // TODO: Accept any heigth
-    if img.height() != 144 {
-        panic!("height != 144 not yet supported");
-    }
-
-    let img = img.to_luma();
-    let tile_rows = img_to_tile_rows(img);
-    //println!("{:?} {:?} {:?} {:?}", img.get_pixel(8,0), img.get_pixel(9,0), img.get_pixel(10,0), img.get_pixel(11,0));
-    //return Ok(());
-
-    println!("Turn on the GameBoy Printer and then press any key to continue...");
-    let _ = io::stdin().read(&mut [0u8]).unwrap();
-
-    // Send confirmation to notify that the printer has ben turned on
-    try!(port.write_all(&[0x00]));
-    try!(port.flush());
-
+// Print up to 9 tile_rows
+fn print<T: SerialPort>(port: &mut BufStream<T>, tile_rows: &[Vec<u8>], margins: (u8, u8)) -> Result<(), io::Error> {
     // Init printer
     println!("Initializing printer...");
     let status = check_ack!(send_print_cmd(port, PrintCommand::Init, &[])?);
     if status.any_info() {
-        println!("Error: {:?}", status);
-        return Ok(());
+        return Err(Error::new(ErrorKind::Other, format!("{:?}", status)));
     }
     // Send data
     println!("Sending data to printer...");
@@ -574,19 +542,73 @@ fn mode_print<T: SerialPort>(port: &mut BufStream<T>, filename: &str) -> Result<
     check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Data, &[])?));
     // Print
     println!("Printing...");
-    check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Print, &[0x01, 0x13, 0xE4, 0x40])?));
+    check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Print,
+                                                  &[0x01, margins.0 << 4 | margins.1, 0xE4, 0x40])?));
     // Query status
     let sleep_time = Duration::from_millis(500);
     loop {
         thread::sleep(sleep_time);
-        let status = check_ack!(send_print_cmd(port, PrintCommand::Print, &[0x01, 0x13, 0xE4, 0x4F])?);
+        let status = check_ack!(send_print_cmd(port, PrintCommand::Print, &[0x01, 0x13, 0xE4, 0x20])?);
         check_status_error!(status);
         if !status.any_info() {
             println!("Printing successfull!");
             break;
         } else if !status.printer_busy {
-            println!("Error: {:?}", status);
+            return Err(Error::new(ErrorKind::Other, format!("{:?}", status)));
+        }
+    }
+    return Ok(());
+}
+
+fn mode_print<T: SerialPort>(port: &mut BufStream<T>, filename: &str) -> Result<(), io::Error> {
+    let img = match image::open(&Path::new(filename)) {
+        Ok(img) => img,
+        Err(err) => {
+            println!("Error opening image at file {:?}: {:?}", filename, err);
             return Ok(());
+        }
+    };
+    let img = img.grayscale();
+    let img = if img.height() == 160 {
+        img.rotate90()
+    } else {
+        img
+    };
+    if img.width() != 160 {
+        println!("Error: image {:?} width should be 160 instead of {:?}", filename, img.width());
+        return Ok(());
+    }
+
+    if img.height() % 16 != 0 {
+        panic!("height is not a multiple of 16!");
+    }
+
+    let img = img.to_luma();
+    let tile_rows = img_to_tile_rows(img);
+
+    //println!("Turn on the GameBoy Printer and then press any key to continue...");
+    //let _ = io::stdin().read(&mut [0u8]).unwrap();
+
+    // Send confirmation to notify that the printer has ben turned on
+    try!(port.write_all(&[0x00]));
+    try!(port.flush());
+
+    let k = ((tile_rows.len() as f64)/9.0).ceil() as usize;
+    for i in 0..k {
+        let margin = if i == 0 {
+            (0x00, 0x00)
+        } else if i == (k-1) {
+            (0x00, 0x03)
+        } else {
+            (0x00, 0x00)
+        };
+        let (a, b) = (i*9, cmp::min(i*9 + 9, tile_rows.len()));
+        if k != 1 {
+            println!("\tPrinting part [{:?}/{:?}]", i+1, k);
+        }
+        print(port, &tile_rows[a..b], margin)?;
+        if i != (k-1) {
+            thread::sleep(Duration::from_millis(400));;
         }
     }
 
