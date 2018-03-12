@@ -209,7 +209,11 @@ fn dev_reset(board: Board) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn gb_link<T: SerialPort>(mut port: &mut BufStream<T>, mode: Mode, filename: &str) -> Result<(), io::Error> {
+fn gb_link<T: SerialPort>(
+    mut port: &mut BufStream<T>,
+    mode: Mode,
+    filename: &str,
+) -> Result<(), io::Error> {
     let mut buf = Vec::new();
     loop {
         try!(port.read_until(b'\n', &mut buf));
@@ -235,9 +239,19 @@ fn mode_sniff<T: SerialPort>(port: &mut BufStream<T>) -> Result<(), io::Error> {
     let mut buf = vec![0, 0];
     loop {
         try!(port.read_exact(&mut buf));
-        let sdin = buf[0];
-        let sdout = buf[1];
-        print!("{:02x}:{:02x} ", sdin, sdout);
+        let sdout = buf[0];
+        let sdin = buf[1];
+        let sdout_s = if sdout == 0 {
+            format!("")
+        } else {
+            format!("{:02x}", sdout)
+        };
+        let sdin_s = if sdin == 0 {
+            format!("")
+        } else {
+            format!("{:02x}", sdin)
+        };
+        print!("{}:{} ", sdout_s, sdin_s);
         io::stdout().flush()?;
     }
 }
@@ -269,38 +283,31 @@ struct PrinterStatus {
 
 impl PrinterStatus {
     fn any_info(&self) -> bool {
-        return self.checksum_error ||
-               self.printer_busy ||
-               self.image_data_full ||
-               self.unprocessed_data ||
-               self.packet_error ||
-               self.paper_jam ||
-               self.other_error ||
-               self.battery_too_low;
+        return self.checksum_error || self.printer_busy || self.image_data_full ||
+            self.unprocessed_data || self.packet_error || self.paper_jam ||
+            self.other_error || self.battery_too_low;
     }
     fn any_error(&self) -> bool {
         return self.checksum_error ||
                //self.printer_busy ||
                //self.image_data_full ||
                //self.unprocessed_data ||
-               self.packet_error ||
-               self.paper_jam ||
-               self.other_error ||
-               self.battery_too_low;
+               self.packet_error || self.paper_jam || self.other_error ||
+            self.battery_too_low;
     }
 }
 
 impl From<u8> for PrinterStatus {
     fn from(b: u8) -> Self {
         PrinterStatus {
-            checksum_error:   (b & (0x01 << 0)) != 0,
-            printer_busy:     (b & (0x01 << 1)) != 0,
-            image_data_full:   (b & (0x01 << 2)) != 0,
+            checksum_error: (b & (0x01 << 0)) != 0,
+            printer_busy: (b & (0x01 << 1)) != 0,
+            image_data_full: (b & (0x01 << 2)) != 0,
             unprocessed_data: (b & (0x01 << 3)) != 0,
-            packet_error:     (b & (0x01 << 4)) != 0,
-            paper_jam:        (b & (0x01 << 5)) != 0,
-            other_error:      (b & (0x01 << 6)) != 0,
-            battery_too_low:   (b & (0x01 << 7)) != 0,
+            packet_error: (b & (0x01 << 4)) != 0,
+            paper_jam: (b & (0x01 << 5)) != 0,
+            other_error: (b & (0x01 << 6)) != 0,
+            battery_too_low: (b & (0x01 << 7)) != 0,
         }
     }
 }
@@ -428,7 +435,7 @@ fn tile_row_to_pixel_rows(tile_row: &[u8]) -> Vec<Vec<u8>> {
     return pixel_rows;
 }
 
-fn u16_to_low_high (w: u16) -> [u8; 2] {
+fn u16_to_low_high(w: u16) -> [u8; 2] {
     return [(w & 0xff) as u8, ((w & 0xff00) >> 8) as u8];
 }
 
@@ -444,7 +451,11 @@ fn gen_crc(cmd: PrintCommand, payload: &[u8]) -> [u8; 2] {
     return u16_to_low_high(crc.0);
 }
 
-fn send_print_cmd<T: SerialPort>(port: &mut BufStream<T>, cmd: PrintCommand, payload: &[u8]) -> Result<Option<PrinterStatus>, io::Error> {
+fn send_print_cmd<T: SerialPort>(
+    port: &mut BufStream<T>,
+    cmd: PrintCommand,
+    payload: &[u8],
+) -> Result<Option<PrinterStatus>, io::Error> {
     // Tell stm32f411 the data length
     port.write_all(&u16_to_low_high(10 + payload.len() as u16))?;
     // write magic
@@ -474,9 +485,9 @@ fn send_print_cmd<T: SerialPort>(port: &mut BufStream<T>, cmd: PrintCommand, pay
 }
 
 fn img_to_tile_rows(img: image::GrayImage) -> Vec<Vec<u8>> {
-    let mut tile_rows: Vec<Vec<u8>> = (0..img.height()/16).map(|_| vec![0u8; 640]).collect();
-    for row in 0..img.height()/8 {
-        for col in 0..img.width()/8 {
+    let mut tile_rows: Vec<Vec<u8>> = (0..img.height() / 16).map(|_| vec![0u8; 640]).collect();
+    for row in 0..img.height() / 8 {
+        for col in 0..img.width() / 8 {
             for y in 0..8 {
                 let mut lsb = 0 as u8;
                 let mut msb = 0 as u8;
@@ -491,11 +502,12 @@ fn img_to_tile_rows(img: image::GrayImage) -> Vec<Vec<u8>> {
                     } else {
                         (0, 0)
                     };
-                    lsb = lsb | (low  << (7-x));
-                    msb = msb | (high << (7-x));
+                    lsb = lsb | (low << (7 - x));
+                    msb = msb | (high << (7 - x));
                 }
-                tile_rows[(row/2) as usize][((row % 2) * 320 + col*16 + y*2    ) as usize] = lsb;
-                tile_rows[(row/2) as usize][((row % 2) * 320 + col*16 + y*2 + 1) as usize] = msb;
+                tile_rows[(row / 2) as usize][((row % 2) * 320 + col * 16 + y * 2) as usize] = lsb;
+                tile_rows[(row / 2) as usize][((row % 2) * 320 + col * 16 + y * 2 + 1) as usize] =
+                    msb;
             }
         }
     }
@@ -524,7 +536,11 @@ macro_rules! check_status_error {
 }
 
 // Print up to 9 tile_rows
-fn print<T: SerialPort>(port: &mut BufStream<T>, tile_rows: &[Vec<u8>], margins: (u8, u8)) -> Result<(), io::Error> {
+fn print<T: SerialPort>(
+    port: &mut BufStream<T>,
+    tile_rows: &[Vec<u8>],
+    margins: (u8, u8),
+) -> Result<(), io::Error> {
     // Init printer
     println!("Initializing printer...");
     let status = check_ack!(send_print_cmd(port, PrintCommand::Init, &[])?);
@@ -535,20 +551,25 @@ fn print<T: SerialPort>(port: &mut BufStream<T>, tile_rows: &[Vec<u8>], margins:
     println!("Sending data to printer...");
     for tile_row in tile_rows {
         //println!("{:?}", tile_row);
-        check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Data, &tile_row)?));
+        check_status_error!(check_ack!(
+            send_print_cmd(port, PrintCommand::Data, &tile_row)?
+        ));
         check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Status, &[])?));
     }
     // Send 0 length data to notify the Printer that we've sent all data
     check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Data, &[])?));
     // Print
     println!("Printing...");
-    check_status_error!(check_ack!(send_print_cmd(port, PrintCommand::Print,
-                                                  &[0x01, margins.0 << 4 | margins.1, 0xE4, 0x40])?));
+    check_status_error!(check_ack!(send_print_cmd(
+        port,
+        PrintCommand::Print,
+        &[0x01, margins.0 << 4 | margins.1, 0xE4, 0x40],
+    )?));
     // Query status
     let sleep_time = Duration::from_millis(500);
     loop {
         thread::sleep(sleep_time);
-        let status = check_ack!(send_print_cmd(port, PrintCommand::Print, &[0x01, 0x13, 0xE4, 0x20])?);
+        let status = check_ack!(send_print_cmd(port, PrintCommand::Status, &[])?);
         check_status_error!(status);
         if !status.any_info() {
             println!("Printing successfull!");
@@ -575,7 +596,11 @@ fn mode_print<T: SerialPort>(port: &mut BufStream<T>, filename: &str) -> Result<
         img
     };
     if img.width() != 160 {
-        println!("Error: image {:?} width should be 160 instead of {:?}", filename, img.width());
+        println!(
+            "Error: image {:?} width should be 160 instead of {:?}",
+            filename,
+            img.width()
+        );
         return Ok(());
     }
 
@@ -593,21 +618,21 @@ fn mode_print<T: SerialPort>(port: &mut BufStream<T>, filename: &str) -> Result<
     try!(port.write_all(&[0x00]));
     try!(port.flush());
 
-    let k = ((tile_rows.len() as f64)/9.0).ceil() as usize;
+    let k = ((tile_rows.len() as f64) / 9.0).ceil() as usize;
     for i in 0..k {
         let margin = if i == 0 {
             (0x00, 0x00)
-        } else if i == (k-1) {
+        } else if i == (k - 1) {
             (0x00, 0x03)
         } else {
             (0x00, 0x00)
         };
-        let (a, b) = (i*9, cmp::min(i*9 + 9, tile_rows.len()));
+        let (a, b) = (i * 9, cmp::min(i * 9 + 9, tile_rows.len()));
         if k != 1 {
-            println!("\tPrinting part [{:?}/{:?}]", i+1, k);
+            println!("\tPrinting part [{:?}/{:?}]", i + 1, k);
         }
         print(port, &tile_rows[a..b], margin)?;
-        if i != (k-1) {
+        if i != (k - 1) {
             thread::sleep(Duration::from_millis(400));;
         }
     }
