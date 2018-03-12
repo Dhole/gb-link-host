@@ -38,4 +38,4 @@ OPTIONS:
 
 ## License
 
-The code is released with the 3-clause BSD License.
+The code is released under the 3-clause BSD License.
