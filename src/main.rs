@@ -519,7 +519,7 @@ macro_rules! check_ack {
         match $a {
             None => {
                 println!("Gameboy Printer didn't ACK, exiting...");
-                return Ok(());
+                return Err(Error::new(ErrorKind::Other, "Missing ACK"));
             },
             Some(status) => status,
         }
@@ -530,7 +530,7 @@ macro_rules! check_status_error {
     ($a:expr) => {
         if $a.any_error() {
             println!("Error: Gameboy Printer: {:?}", $a);
-            return Ok(());
+            return Err(Error::new(ErrorKind::Other, format!("{:?}", $a)));
         }
     }
 }
@@ -604,12 +604,16 @@ fn mode_print<T: SerialPort>(port: &mut BufStream<T>, filename: &str) -> Result<
         return Ok(());
     }
 
-    if img.height() % 16 != 0 {
+    let height = (img.height() as f64 / 16.0).ceil() as u32 * 16;
+    let img_big = image::DynamicImage::new_luma8(img.width(), height);
+    let mut img_big = img_big.brighten(256);
+    img_big.copy_from(&img, 0, 0);
+    if img_big.height() % 16 != 0 {
         panic!("height is not a multiple of 16!");
     }
 
-    let img = img.to_luma();
-    let tile_rows = img_to_tile_rows(img);
+    let img_big = img_big.to_luma();
+    let tile_rows = img_to_tile_rows(img_big);
 
     //println!("Turn on the GameBoy Printer and then press any key to continue...");
     //let _ = io::stdin().read(&mut [0u8]).unwrap();
